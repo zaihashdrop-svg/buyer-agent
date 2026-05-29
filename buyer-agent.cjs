@@ -59,7 +59,7 @@ function sha256Hex(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-// ─── Download helper for artifact files ───
+// ─── Download/file fetch helpers ───
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
@@ -68,6 +68,17 @@ function downloadFile(url, dest) {
       const file = fs.createWriteStream(dest);
       res.pipe(file);
       file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', reject);
+  });
+}
+function fetchBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, (res) => {
+      if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
     }).on('error', reject);
   });
 }
@@ -90,6 +101,7 @@ function jsonSafe(obj) {
 const API_BASE = 'https://api.santaclawz.ai';
 const BASE_RPC = 'https://mainnet.base.org';
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const DEFAULT_INBOX_URL = process.env.BUYER_INBOX_URL || 'http://194.163.187.163:3003';
 
 // ─── Agent matching rules ───
 const AGENT_RULES = [
@@ -401,10 +413,11 @@ async function main() {
         const timestamp = Date.now().toString(36);
         const safeName = `${timestamp}_${slug}`;
 
-        // Try to download the actual artifact from the SCZ result
+        // Try to download the actual artifact
         let savedFile = null;
+
+        // 1) Check the hire response for embedded image
         if (result.responseBody) {
-          // Check if it's an image (base64 or URL)
           const bodyStr = typeof result.responseBody === 'string' ? result.responseBody : JSON.stringify(result.responseBody);
           const b64Match = bodyStr.match(/data:image\/(jpeg|png|webp);base64,([a-zA-Z0-9+/=]+)/);
           if (b64Match) {
@@ -414,12 +427,23 @@ async function main() {
             fs.writeFileSync(filePath, imgData);
             savedFile = filePath;
             console.log(`🖼️ ${filePath} (${(imgData.length / 1024).toFixed(0)}KB)`);
-          } else if (bodyStr.match(/https?:\/\/.+\.(jpeg|jpg|png|gif|webp)/i)) {
-            const url = bodyStr.match(/https?:\/\/[^\s"']+\.(jpeg|jpg|png|gif|webp)/i)[0];
-            const ext = url.match(/\.(jpeg|jpg|png|gif|webp)/i)[1].replace('jpeg','jpg');
-            const filePath = path.join(outputDir, `${safeName}.${ext}`);
-            try { await downloadFile(url, filePath); savedFile = filePath; console.log(`🖼️ ${filePath}`); }
-            catch(e) { /* fall through to json */ }
+          }
+        }
+
+        // 2) For image agents, fetch from buyer-inbox
+        if (!savedFile && agent.agentName === 'Zaitek Technologies') {
+          try {
+            const inboxUrl = `${DEFAULT_INBOX_URL}/latest-image`;
+            const imgData = await fetchBuffer(inboxUrl);
+            if (imgData && imgData.length > 1000) {
+              const ext = 'jpg';
+              const filePath = path.join(outputDir, `${safeName}.${ext}`);
+              fs.writeFileSync(filePath, imgData);
+              savedFile = filePath;
+              console.log(`🖼️ ${filePath} (${(imgData.length / 1024).toFixed(0)}KB)`);
+            }
+          } catch(e) {
+            // Fall through to JSON summary
           }
         }
 
