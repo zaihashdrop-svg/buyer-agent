@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 /**
- * BUYER AGENT — SantaClawz cross-platform buyer terminal
+ * BUYER AGENT v2 — SantaClawz autonomous multi-file buyer terminal
  * Usage: node buyer-agent.cjs
  * Runs on: Windows CMD, PowerShell, Linux/macOS terminal
  *
- * No dependencies to install manually — auto-installs ethers.js on first run.
+ * Features:
+ *  - Auto-classifies task type and routes to the best SCZ agent
+ *  - Downloads ALL deliverables (image.jpg + description.md + etc.)
+ *  - Saves files to output/ with proper filenames
  */
 
 // ─── Auto-install ethers if missing ───
@@ -51,40 +54,12 @@ function normalizeValue(value) {
     }
     return value;
 }
-function stableStringify(value) {
-    return JSON.stringify(normalizeValue(value));
-}
 
-function sha256Hex(value) {
-  return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
-}
-
-// ─── Download/file fetch helpers ───
-function downloadFile(url, dest) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    mod.get(url, (res) => {
-      if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
-      const file = fs.createWriteStream(dest);
-      res.pipe(file);
-      file.on('finish', () => { file.close(); resolve(); });
-    }).on('error', reject);
-  });
-}
-function fetchBuffer(url) {
-  return new Promise((resolve, reject) => {
-    const mod = url.startsWith('https') ? https : http;
-    mod.get(url, (res) => {
-      if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
-      const chunks = [];
-      res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-    }).on('error', reject);
-  });
-}
-
-function canonicalDigest(value) {
-  return { sha256Hex: sha256Hex(stableStringify(value)) };
+function canonicalDigest(payload) {
+    const normalized = normalizeValue(payload);
+    const json = JSON.stringify(normalized);
+    const sha256Hex = crypto.createHash("sha256").update(json, "utf-8").digest("hex");
+    return { stableJson: json, sha256Hex };
 }
 
 function jsonSafe(obj) {
@@ -98,77 +73,106 @@ function jsonSafe(obj) {
   return obj;
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 const API_BASE = 'https://api.santaclawz.ai';
 const BASE_RPC = 'https://mainnet.base.org';
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-const DEFAULT_INBOX_URL = process.env.BUYER_INBOX_URL || 'http://194.163.187.163:3003';
 
-// ─── Agent matching rules ───
-const AGENT_RULES = [
-  { keywords: ['image', 'picture', 'generate', 'visual', 'photo', 'draw', 'create.*png',
-               'create.*jpg', 'illustration', 'artwork', 'graphic', 'design', 'poster',
-               'banner', 'logo', 'meme', 'art', 'painting', 'render', 'cartoon'],
-    agentName: 'Zaitek Technologies', id: 'zaitek-technologies--session_agent_b4a646d96b37', price: '$1.00' },
-  { keywords: ['audit', 'security', 'vulnerability', 'reentrancy', 'smart contract',
-               'solidity', 'exploit', 'hack', 'bug', 'overflow', 'injection'],
-    agentName: 'Code Audit Agent', id: 'code-audit-agent--session_agent_51a8f5e04659', price: '$1.00' },
-  { keywords: ['job pack', 'content idea', 'bundle', 'digital product', 'pack'],
-    agentName: 'Agent Job Pack', id: 'agent-job-pack--session_agent_481978b8e6ea', price: '$0.25' },
-  { keywords: ['windows', 'document', 'spreadsheet', 'excel', 'word', 'powerpoint'],
-    agentName: 'Zaitek Technologies (Windows)', id: 'zaitek-technologies-windows--session_agent_788cc04c082a', price: '$0.25' },
+// ─── AGENT CATALOG ───
+// Each agent: { keywords, id, name, price, description, capabilities }
+const AGENTS = [
+  {
+    id: 'zaitek-technologies--session_agent_b4a646d96b37',
+    name: 'Zaitek Technologies',
+    price: 1.00,
+    keywords: ['image', 'picture', 'photo', 'generate', 'visual', 'draw', 'illustrate',
+               'art', 'graphic', 'design', 'poster', 'banner', 'logo', 'meme',
+               'artwork', 'infographic', 'create.*(png|jpg)', 'visualize'],
+    description: 'Image generation via Grok AI — returns image.jpg + description.md'
+  },
+  {
+    id: 'zaiclaw--session_agent_1ef352f6cda1',
+    name: 'zaiclaw',
+    price: 0.25,
+    keywords: ['text', 'write', 'document', 'article', 'blog', 'summary', 'research',
+               'explain', 'report', 'analysis', 'draft', 'markdown', 'content',
+               'describe', 'write.*md', 'write.*file', 'generate.*text', 'reply'],
+    description: 'Text generation via Hermes AI — returns agent-response.txt'
+  },
+  {
+    id: 'code-audit-agent--session_agent_51a8f5e04659',
+    name: 'Code Audit Agent',
+    price: 1.00,
+    keywords: ['audit', 'security', 'vulnerability', 'reentrancy', 'smart contract',
+               'solidity', 'exploit', 'hack', 'review.*code', 'code.*review',
+               'bug.*find', 'static.*analysis'],
+    description: 'Smart contract security audit'
+  },
+  {
+    id: 'agent-job-pack--session_agent_481978b8e6ea',
+    name: 'Agent Job Pack',
+    price: 0.25,
+    keywords: ['job pack', 'content idea', 'bundle', 'digital product', 'pack',
+               'proposal', 'bid', 'qa.*checklist', 'risk.*register'],
+    description: 'Bid analysis, proposals, QA checklists'
+  },
+  {
+    id: 'zaitek-technologies-windows--session_agent_788cc04c082a',
+    name: 'Zaitek Technologies (Windows)',
+    price: 0.25,
+    keywords: ['windows', 'spreadsheet', 'excel', 'document.*format', '.docx'],
+    description: 'Windows-specific agent for documents/spreadsheets'
+  },
 ];
 
-const DEFAULT_AGENT = {
-  agentName: 'zaiclaw', id: 'zaiclaw--session_agent_1ef352f6cda1', price: '$0.25'
-};
-
-function matchAgent(task) {
+// ─── Smart task classifier ───
+// Uses regex keyword matching + fallback LLM-style routing
+function classifyTask(task) {
   const t = task.toLowerCase();
-  for (const rule of AGENT_RULES) {
-    for (const kw of rule.keywords) {
-      try {
-        if (new RegExp('\\b' + kw.replace(/\.\*/g, '.*') + '\\b', 'i').test(t)) return rule;
-      } catch(e) {
-        if (t.includes(kw)) return rule;
-      }
-    }
+
+  // Image generation — highest priority match
+  if (/image|picture|photo|generate|draw|illustrate|artwork|art.*(of|with)|graphic|design|poster|banner|logo|meme|infographic|visualize|create.*visual|create.*image/i.test(t)) {
+    return AGENTS[0]; // Zaitek Technologies — image gen
   }
-  return DEFAULT_AGENT;
+
+  // Code audit
+  if (/audit|smart contract|solidity|vulnerability|reentrancy|exploit.*find/i.test(t)) {
+    return AGENTS[2]; // Code Audit Agent
+  }
+
+  // Job pack / proposal
+  if (/job pack|bid|proposal|qa.*checklist|risk.*register|bundle|digital product/i.test(t)) {
+    return AGENTS[3]; // Agent Job Pack
+  }
+
+  // Windows-specific
+  if (/windows|excel|spreadsheet|\.docx|powerpoint/i.test(t)) {
+    return AGENTS[4]; // Zaitek (Windows)
+  }
+
+  // Default: text tasks → zaiclaw (cheapest)
+  return AGENTS[1]; // zaiclaw — text gen
 }
 
-// ─── Simple fetch polyfill (no external deps) ───
-function simpleFetch(url, options = {}) {
+// ─── Download helpers ───
+function downloadUrl(url) {
   return new Promise((resolve, reject) => {
-    const isHttps = url.startsWith('https');
-    const mod = isHttps ? https : http;
-    const urlObj = new URL(url);
-    const body = options.body ? Buffer.from(options.body) : null;
-    const req = mod.request({
-      hostname: urlObj.hostname,
-      port: urlObj.port || (isHttps ? 443 : 80),
-      path: urlObj.pathname + urlObj.search,
-      method: options.method || 'GET',
-      headers: Object.assign({ 'content-type': 'application/json' }, options.headers || {}),
-    }, (res) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, { timeout: 60000 }, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf8');
-        let data;
-        try { data = JSON.parse(raw); } catch(e) { data = raw; }
-        resolve({ status: res.statusCode, json: async () => data, text: async () => raw });
-      });
-    });
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+    }).on('error', reject).on('timeout', function() { this.destroy(); reject(new Error('timeout')); });
   });
 }
 
 // ─── x402 Hire Engine ───
 async function hireAgent(agent, task, wallet) {
-  const preflightRes = await simpleFetch(`${API_BASE}/api/agents/${agent.id}/hire`, {
+  // Preflight
+  const preflightRes = await fetch(`${API_BASE}/api/agents/${agent.id}/hire`, {
     method: 'POST',
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ taskPrompt: task, requesterContact: `buyer:${wallet.address}` })
   });
   const hireResp = await preflightRes.json();
@@ -189,15 +193,13 @@ async function hireAgent(agent, task, wallet) {
   const domain = { name: 'USD Coin', version: '2', chainId: 8453, verifyingContract: USDC_ADDRESS };
   const types = {
     TransferWithAuthorization: [
-      { name: 'from', type: 'address' },
-      { name: 'to', type: 'address' },
-      { name: 'value', type: 'uint256' },
-      { name: 'validAfter', type: 'uint256' },
-      { name: 'validBefore', type: 'uint256' },
-      { name: 'nonce', type: 'bytes32' },
+      { name: 'from', type: 'address' }, { name: 'to', type: 'address' },
+      { name: 'value', type: 'uint256' }, { name: 'validAfter', type: 'uint256' },
+      { name: 'validBefore', type: 'uint256' }, { name: 'nonce', type: 'bytes32' },
     ],
   };
 
+  // Sign seller + protocol authorizations
   const sellerNonce = '0x' + crypto.randomBytes(32).toString('hex');
   const sellerMsg = { from: wallet.address, to: sellerPayTo, value: sellerAmount, validAfter: 0n, validBefore, nonce: sellerNonce };
   const sellerSig = await signTypedData(wallet, domain, types, sellerMsg);
@@ -208,6 +210,7 @@ async function hireAgent(agent, task, wallet) {
   const protocolSig = await signTypedData(wallet, domain, types, protocolMsg);
   const protocolParsed = parseSignature(protocolSig);
 
+  // Build payload
   const amount = accept.price;
   const paymentId = 'pay_' + crypto.randomBytes(16).toString('hex');
   const now = new Date();
@@ -223,15 +226,12 @@ async function hireAgent(agent, task, wallet) {
       network: 'eip155:8453', payTo: accept.payTo, asset: USDC_ADDRESS, amount,
       extra: { feeSplit: { grossAmount: amount, sellerAmount: fees.sellerAmount, protocolFeeAmount: fees.protocolFeeAmount, protocolFeePayTo: fees.protocolFeePayTo, protocolFeePayToLabel: 'SantaClawz Protocol Fee', protocolFeeRecipient: fees.protocolFeePayTo, sellerPayTo: fees.sellerPayTo, feeSettlementMode: 'exact-eip3009-split-v1', version: 'protocol-owner-fee-v1', feeBps: fees.feeBps } },
     },
-    payload: {
-      signature: sellerSig,
-      authorization: { from: wallet.address, to: sellerPayTo, value: sellerAmount.toString(), validAfter: '0', validBefore: validBefore.toString(), nonce: sellerNonce, v: '0x' + sellerParsed.v.toString(16), r: sellerParsed.r, s: sellerParsed.s },
-      feeAuthorization: { signature: protocolSig, authorization: { from: wallet.address, to: protocolPayTo, value: protocolAmount.toString(), validAfter: '0', validBefore: validBefore.toString(), nonce: protocolNonce, v: '0x' + protocolParsed.v.toString(16), r: protocolParsed.r, s: protocolParsed.s } },
-    },
+    payload: { signature: sellerSig, authorization: { from: wallet.address, to: sellerPayTo, value: sellerAmount.toString(), validAfter: '0', validBefore: validBefore.toString(), nonce: sellerNonce, v: '0x' + sellerParsed.v.toString(16), r: sellerParsed.r, s: sellerParsed.s }, feeAuthorization: { signature: protocolSig, authorization: { from: wallet.address, to: protocolPayTo, value: protocolAmount.toString(), validAfter: '0', validBefore: validBefore.toString(), nonce: protocolNonce, v: '0x' + protocolParsed.v.toString(16), r: protocolParsed.r, s: protocolParsed.s } } },
     feeAuthorization: { typedData: { domain, types, message: protocolMsg }, signature: protocolSig },
     resource: { url: hireResp.resource, description: 'SantaClawz agent hire', mimeType: 'application/json' },
   };
 
+  // authorizationDigest
   const { sha256Hex: authDigest } = canonicalDigest(jsonSafe(payload));
   payload.authorizationDigest = authDigest;
 
@@ -248,7 +248,16 @@ async function hireAgent(agent, task, wallet) {
     );
     await tx.wait();
   } catch(e) {
-    // Non-critical
+    try {
+      const tx2 = await usdc.transferWithAuthorization(
+        wallet.address, protocolPayTo, protocolAmount, 0n, validBefore,
+        protocolNonce, protocolParsed.v, protocolParsed.r, protocolParsed.s,
+        { gasLimit: 100000 }
+      );
+      await tx2.wait();
+    } catch(e2) {
+      // Non-critical
+    }
   }
 
   // Submit
@@ -256,44 +265,78 @@ async function hireAgent(agent, task, wallet) {
     taskPrompt: task, requesterContact: `buyer:${wallet.address}`,
     paymentPayload: payload,
   };
-  const res = await simpleFetch(`${API_BASE}/api/agents/${agent.id}/hire`, {
-    method: 'POST',
-    body: JSON.stringify(jsonSafe(body)),
+  const res = await fetch(`${API_BASE}/api/agents/${agent.id}/hire`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(jsonSafe(body)),
   });
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
 
   if (res.status >= 400) throw new Error(data.error || `HTTP ${res.status}`);
 
-  return {
-    requestId: data.requestId,
-    status: data.status,
-    paymentStatus: data.paymentStatus,
-    responseBody: data.localResponseBody,
-    relayTrace: data.relayTrace,
-  };
+  return { requestId: data.requestId, status: data.status, paymentStatus: data.paymentStatus, data };
+}
+
+// ─── Download ALL deliverables from a hire response ───
+async function downloadDeliverables(result, outputDir) {
+  const deliverables = result.data?.verified_output?.deliverables || [];
+  if (deliverables.length === 0) {
+    console.log('   No file deliverables in response');
+    return [];
+  }
+
+  const files = [];
+  for (const d of deliverables) {
+    const name = d.name || `deliverable_${files.length}`;
+    const uri = d.uri;
+    const sha256 = d.sha256;
+    const contentType = d.content_type || 'application/octet-stream';
+
+    if (!uri) {
+      console.log(`   ⚠️  ${name} — no URI, skipping`);
+      continue;
+    }
+
+    try {
+      console.log(`   📥 Downloading ${name}...`);
+      const buf = await downloadUrl(uri);
+
+      // Verify SHA-256 if available
+      if (sha256) {
+        const computed = crypto.createHash('sha256').update(buf).digest('hex');
+        if (computed !== sha256) {
+          console.log(`   ⚠️  SHA-256 mismatch for ${name} — saved anyway`);
+        }
+      }
+
+      const filePath = path.join(outputDir, name);
+      fs.writeFileSync(filePath, buf);
+      const sizeKB = (buf.length / 1024).toFixed(1);
+      console.log(`   ✅ ${name} (${sizeKB} KB)`);
+      files.push({ name, path: filePath, size: buf.length });
+    } catch (err) {
+      console.log(`   ❌ Failed to download ${name}: ${err.message}`);
+    }
+  }
+
+  return files;
 }
 
 // ─── Main ───
 async function main() {
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║      🤖  BUYER AGENT  v2  —  MULTI-FILE         ║
+║  Auto-classifies tasks, downloads ALL files     ║
+╚══════════════════════════════════════════════════╝
+`);
+
+  // Step 1: Private key
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   const question = (q) => new Promise(r => rl.question(q, r));
 
-  console.log(`
-╔══════════════════════════════════════════╗
-║         🤖  BUYER AGENT  v1.0           ║
-║     SantaClawz Cross-Platform Buyer      ║
-╚══════════════════════════════════════════╝`);
-
-  // Step 1: Private key
   let pk = process.env.BUYER_PK || '';
   if (!pk) {
     pk = (await question('🔐 Enter wallet private key (0x...): ')).trim();
-    if (pk && !pk.startsWith('0x')) pk = '0x' + pk;
-  }
-
-  if (!pk) {
-    console.log('❌ No private key provided. Set BUYER_PK env var or enter it.');
-    process.exit(1);
+    if (!pk.startsWith('0x')) pk = '0x' + pk;
   }
 
   // Step 2: Connect
@@ -310,46 +353,46 @@ async function main() {
   // Step 3: Check balance
   const usdc = new ethers.Contract(USDC_ADDRESS, [
     'function balanceOf(address) view returns (uint256)',
+    'function transferWithAuthorization(address,address,uint256,uint256,uint256,bytes32,uint8,bytes32,bytes32) external',
   ], provider);
   let usdcBal, ethBal;
   try {
     usdcBal = await usdc.balanceOf(wallet.address);
     ethBal = await provider.getBalance(wallet.address);
   } catch(e) {
-    console.log('❌ Cannot reach Base network. Check connection.');
+    console.log('❌ Cannot read balances. Check RPC/network.');
     process.exit(1);
   }
-  console.log(`💰 USDC: $${formatUnits(usdcBal, 6)}`);
-  console.log(`⛽ ETH: ${Number(formatEther(ethBal)).toFixed(6)}`);
+  console.log(`💰 USDC: $${formatUnits(usdcBal, 6)} | ETH: ${formatEther(ethBal).substring(0,8)}`);
 
-  if (usdcBal == 0 || (typeof usdcBal === 'object' && usdcBal.isZero && usdcBal.isZero())) {
+  if (usdcBal.isZero()) {
     console.log('❌ No USDC. Fund your wallet on Base mainnet first.');
     process.exit(1);
   }
 
   // Step 4: Fetch available agents
-  console.log('📡 Fetching agents...');
-  let hireable = [];
-  try {
-    const agentRes = await simpleFetch(`${API_BASE}/api/agents`);
-    const allAgents = await agentRes.json();
-    hireable = allAgents.filter(a => a.readiness?.hireable && a.runtimeStatus === 'live');
-    console.log(`📋 ${hireable.length} agents available:\n`);
-    for (const a of hireable) {
-      console.log(`   ${a.agentName.padEnd(36)} $${(a.fixedAmountUsd || '?').padEnd(5)}`);
-    }
-    console.log('');
-  } catch(e) {
-    console.log('⚠️  Could not fetch agents list (API may be down). Will use default matching.');
+  const agentRes = await fetch(`${API_BASE}/api/agents`);
+  const allAgents = await agentRes.json();
+  const hireable = allAgents.filter(a => a.readiness?.hireable && a.runtimeStatus === 'live');
+  console.log(`📋 ${hireable.length} agents available:\n`);
+  for (const a of hireable) {
+    console.log(`   ${a.agentName.padEnd(32)} $${(a.fixedAmountUsd || '?').padEnd(5)} ${a.runtimeStatus || ''}`);
   }
+  console.log('');
 
-  // Step 5: Output directory
+  // Step 5: Output dir
   const outputDir = path.join(process.cwd(), 'output');
   fs.mkdirSync(outputDir, { recursive: true });
 
-  console.log('┌─ Chat mode ────────────────────────────────────────────────┐');
-  console.log('│ Type a task, or: quit | balance | agents | help            │');
-  console.log('└────────────────────────────────────────────────────────────┘\n');
+  // Step 6: Chat loop
+  console.log('┌─ Chat mode ───────────────────────────────────────────────────────────┐');
+  console.log('│ Type a task, or: quit | balance | agents | list                       │');
+  console.log('│                                                                       │');
+  console.log('│ EXAMPLES:                                                             │');
+  console.log('│   "generate an image of a cat in space"  → hires Zaitek, gets image   │');
+  console.log('│   "write a blog post about AI"           → hires zaiclaw, gets text   │');
+  console.log('│   "audit this smart contract..."          → hires Code Audit Agent     │');
+  console.log('└───────────────────────────────────────────────────────────────────────┘\n');
 
   let running = true;
   while (running) {
@@ -357,7 +400,7 @@ async function main() {
     const cmd = input.toLowerCase();
 
     if (!input) continue;
-    if (['quit', 'exit', 'q'].includes(cmd)) {
+    if (cmd === 'quit' || cmd === 'exit' || cmd === 'q') {
       console.log('👋 Bye!');
       running = false;
       break;
@@ -367,114 +410,70 @@ async function main() {
       console.log(`💰 USDC: $${formatUnits(b, 6)}`);
       continue;
     }
-    if (cmd === 'agents') {
+    if (cmd === 'agents' || cmd === 'list') {
       for (const a of hireable) {
-        console.log(`   ${a.agentName.padEnd(36)} $${(a.fixedAmountUsd || '?').padEnd(5)}`);
+        console.log(`   ${a.agentName.padEnd(32)} $${(a.fixedAmountUsd || '?').padEnd(5)}`);
       }
       continue;
     }
-    if (cmd === 'help') {
-      console.log('Commands: quit, balance, agents');
-      console.log('Or type any task and the buyer agent picks the best AI agent for it.');
-      console.log('Examples:');
-      console.log('  "generate a futuristic city image" → Zaitek Tech ($1.00)');
-      console.log('  "audit this Solidity contract"     → Code Audit ($1.00)');
-      console.log('  "write a poem about AI"             → zaiclaw ($0.25)');
-      console.log('  "research web3 market trends"       → zaiclaw ($0.25)');
-      continue;
-    }
 
-    // Match agent
-    const agent = matchAgent(input);
+    // Auto-classify task to best agent
+    const agent = classifyTask(input);
     const usdcNum = parseFloat(formatUnits(usdcBal, 6));
-    const agentPrice = parseFloat(agent.price.replace('$', ''));
-    if (usdcNum < agentPrice) {
-      console.log(`❌ Insufficient balance ($${usdcNum.toFixed(2)}) for ${agent.agentName} (${agent.price})`);
+    if (usdcNum < agent.price) {
+      console.log(`❌ Insufficient balance ($${usdcNum.toFixed(2)}) for ${agent.name} ($${agent.price.toFixed(2)})`);
       continue;
     }
 
-    console.log(`🤖 → ${agent.agentName} (${agent.price})`);
-
-    const spinner = ['|', '/', '-', '\\'];
-    let spi = 0;
-    const spin = setInterval(() => { process.stdout.write('\r⏳ Processing... ' + spinner[spi % 4]); spi++; }, 200);
+    console.log(`🤖 ${agent.name} ($${agent.price.toFixed(2)}) ← ${input.substring(0, 40)}${input.length > 40 ? '...' : ''}`);
 
     try {
       const result = await hireAgent(agent, input, wallet);
-      clearInterval(spin);
+
+      console.log(`   Status: ${result.status} | Payment: ${result.paymentStatus} | ID: ${result.requestId}`);
 
       if (result.paymentStatus === 'settled' || result.status === 'completed') {
-        process.stdout.write('\r✅ Done!                          \n');
-        usdcBal = await usdc.balanceOf(wallet.address);
-        console.log(`💰 Balance: $${formatUnits(usdcBal, 6)}`);
+        usdcBal = await usdc.balanceOf(wallet.address); // refresh
 
-        // Save output
-        const slug = input.replace(/[^a-z0-9]/gi, '_').substring(0, 40).toLowerCase();
+        // Generate slug for output folder
+        const slug = input.replace(/[^a-z0-9]/gi, '_').substring(0, 60).toLowerCase();
         const timestamp = Date.now().toString(36);
-        const safeName = `${timestamp}_${slug}`;
+        const jobDir = path.join(outputDir, `${timestamp}_${slug}`);
+        fs.mkdirSync(jobDir, { recursive: true });
 
-        // Try to download the actual artifact
-        let savedFile = null;
+        // Download ALL files from the deliverables list
+        const downloadedFiles = await downloadDeliverables(result, jobDir);
 
-        // 1) Check the hire response for embedded image
-        if (result.responseBody) {
-          const bodyStr = typeof result.responseBody === 'string' ? result.responseBody : JSON.stringify(result.responseBody);
-          const b64Match = bodyStr.match(/data:image\/(jpeg|png|webp);base64,([a-zA-Z0-9+/=]+)/);
-          if (b64Match) {
-            const ext = b64Match[1] === 'jpeg' ? 'jpg' : b64Match[1];
-            const imgData = Buffer.from(b64Match[2], 'base64');
-            const filePath = path.join(outputDir, `${safeName}.${ext}`);
-            fs.writeFileSync(filePath, imgData);
-            savedFile = filePath;
-            console.log(`🖼️ ${filePath} (${(imgData.length / 1024).toFixed(0)}KB)`);
+        if (downloadedFiles.length > 0) {
+          console.log(`   📁 ${jobDir} (${downloadedFiles.length} file(s))`);
+          for (const f of downloadedFiles) {
+            const sizeStr = f.size > 1024 ? `${(f.size / 1024).toFixed(1)} KB` : `${f.size} B`;
+            const ext = path.extname(f.name).toLowerCase();
+            const icon = ['.jpg', '.jpeg', '.png', '.gif', '.webp'].includes(ext) ? '🖼️' :
+                         ['.md', '.txt'].includes(ext) ? '📄' :
+                         ['.mp4', '.webm'].includes(ext) ? '🎬' : '📎';
+            console.log(`   ${icon} ${f.name} (${sizeStr})`);
           }
-        }
-
-        // 2) For image agents, fetch from buyer-inbox
-        if (!savedFile && agent.agentName === 'Zaitek Technologies') {
-          try {
-            const inboxUrl = `${DEFAULT_INBOX_URL}/latest-image`;
-            const imgData = await fetchBuffer(inboxUrl);
-            if (imgData && imgData.length > 1000) {
-              const ext = 'jpg';
-              const filePath = path.join(outputDir, `${safeName}.${ext}`);
-              fs.writeFileSync(filePath, imgData);
-              savedFile = filePath;
-              console.log(`🖼️ ${filePath} (${(imgData.length / 1024).toFixed(0)}KB)`);
-            }
-          } catch(e) {
-            // Fall through to JSON summary
-          }
-        }
-
-        if (!savedFile) {
-          // Save summary JSON
+        } else {
+          // Fallback: save response text
           const summary = JSON.stringify({
-            agent: agent.agentName, task: input, requestId: result.requestId,
-            status: result.status, paymentStatus: result.paymentStatus,
-            completedAt: new Date().toISOString(),
-            relayTrace: result.relayTrace,
+            agent: agent.name,
+            task: input,
+            requestId: result.requestId,
+            status: result.status,
+            paymentStatus: result.paymentStatus,
+            completedAt: new Date().toISOString()
           }, null, 2);
-          const filePath = path.join(outputDir, `${safeName}.json`);
-          fs.writeFileSync(filePath, summary);
-          console.log(`📄 ${filePath}`);
+          const summaryPath = path.join(jobDir, 'response.json');
+          fs.writeFileSync(summaryPath, summary);
+          console.log(`   📄 ${summaryPath}`);
         }
 
-        // Show relay trace
-        if (result.relayTrace) {
-          const steps = result.relayTrace.filter(s => s.status === 'completed' || s.status === 'failed');
-          for (const s of steps.slice(0, 4)) {
-            const mark = s.status === 'completed' ? '✅' : '❌';
-            console.log(`   ${mark} ${s.step}`);
-          }
-        }
+        console.log(`💰 Balance: $${formatUnits(usdcBal, 6)}\n`);
       } else {
-        process.stdout.write('\r');
         console.log(`⚠️  ${result.status} — payment: ${result.paymentStatus}`);
       }
     } catch(e) {
-      clearInterval(spin);
-      process.stdout.write('\r');
       console.log(`❌ ${e.message}`);
     }
   }
@@ -482,4 +481,4 @@ async function main() {
   rl.close();
 }
 
-main().catch(e => { console.error('\n❌ Fatal:', e.message); process.exit(1); });
+main().catch(e => { console.error('Fatal:', e.message); process.exit(1); });
