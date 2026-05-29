@@ -59,6 +59,19 @@ function sha256Hex(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
+// ─── Download helper for artifact files ───
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    mod.get(url, (res) => {
+      if (res.statusCode >= 400) return reject(new Error(`HTTP ${res.statusCode}`));
+      const file = fs.createWriteStream(dest);
+      res.pipe(file);
+      file.on('finish', () => { file.close(); resolve(); });
+    }).on('error', reject);
+  });
+}
+
 function canonicalDigest(value) {
   return { sha256Hex: sha256Hex(stableStringify(value)) };
 }
@@ -388,18 +401,33 @@ async function main() {
         const timestamp = Date.now().toString(36);
         const safeName = `${timestamp}_${slug}`;
 
+        // Try to download the actual artifact from the SCZ result
+        let savedFile = null;
         if (result.responseBody) {
-          const txt = typeof result.responseBody === 'string' ? result.responseBody : JSON.stringify(result.responseBody, null, 2);
-          const filePath = path.join(outputDir, `${safeName}.txt`);
-          fs.writeFileSync(filePath, txt);
-          console.log(`📄 ${filePath}`);
-        } else {
+          // Check if it's an image (base64 or URL)
+          const bodyStr = typeof result.responseBody === 'string' ? result.responseBody : JSON.stringify(result.responseBody);
+          const b64Match = bodyStr.match(/data:image\/(jpeg|png|webp);base64,([a-zA-Z0-9+/=]+)/);
+          if (b64Match) {
+            const ext = b64Match[1] === 'jpeg' ? 'jpg' : b64Match[1];
+            const imgData = Buffer.from(b64Match[2], 'base64');
+            const filePath = path.join(outputDir, `${safeName}.${ext}`);
+            fs.writeFileSync(filePath, imgData);
+            savedFile = filePath;
+            console.log(`🖼️ ${filePath} (${(imgData.length / 1024).toFixed(0)}KB)`);
+          } else if (bodyStr.match(/https?:\/\/.+\.(jpeg|jpg|png|gif|webp)/i)) {
+            const url = bodyStr.match(/https?:\/\/[^\s"']+\.(jpeg|jpg|png|gif|webp)/i)[0];
+            const ext = url.match(/\.(jpeg|jpg|png|gif|webp)/i)[1].replace('jpeg','jpg');
+            const filePath = path.join(outputDir, `${safeName}.${ext}`);
+            try { await downloadFile(url, filePath); savedFile = filePath; console.log(`🖼️ ${filePath}`); }
+            catch(e) { /* fall through to json */ }
+          }
+        }
+
+        if (!savedFile) {
+          // Save summary JSON
           const summary = JSON.stringify({
-            agent: agent.agentName,
-            task: input,
-            requestId: result.requestId,
-            status: result.status,
-            paymentStatus: result.paymentStatus,
+            agent: agent.agentName, task: input, requestId: result.requestId,
+            status: result.status, paymentStatus: result.paymentStatus,
             completedAt: new Date().toISOString(),
             relayTrace: result.relayTrace,
           }, null, 2);
