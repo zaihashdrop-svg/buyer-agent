@@ -103,19 +103,17 @@ async function generateOnVPS(task, jobDir) {
     const files = result.data.files || [];
     const downloaded = [];
     for (const f of files) {
-      const src = f.local_path || '';
-      if (src && fs.existsSync(src)) {
-        const buf = fs.readFileSync(src);
-        const dest = path.join(jobDir, f.name);
-        fs.writeFileSync(dest, buf);
-        downloaded.push({ name: f.name, path: dest, size: buf.length });
-      } else if (f.url) {
+      const url = f.download_url || f.url || '';
+      if (url) {
         try {
-          const buf = await downloadUrl(f.url);
+          console.log(`   📥 ${f.name}...`);
+          const buf = await downloadUrl(url);
           const dest = path.join(jobDir, f.name);
           fs.writeFileSync(dest, buf);
           downloaded.push({ name: f.name, path: dest, size: buf.length });
-        } catch(e) { console.log(`   ⚠️ Download ${f.name} failed: ${e.message}`); }
+        } catch(e) { console.log(`   ⚠️ ${f.name}: ${e.message}`); }
+      } else {
+        console.log(`   ⚠️ ${f.name}: no download URL`);
       }
     }
     const text = result.data.output_text || '';
